@@ -28,6 +28,7 @@ Implementation Notes
 __version__ = "0.0.0-auto.0"
 __repo__ = "https:# github.com/adafruit/Adafruit_CircuitPython_BNO08x.git"
 
+from abc import abstractmethod
 from struct import unpack_from, pack_into
 from collections import namedtuple
 import time
@@ -62,6 +63,8 @@ _FRS_WRITE_RESPONSE = const(0xF5)
 _FRS_READ_REQUEST = const(0xF4)
 _FRS_READ_RESPONSE = const(0xF3)
 
+_FRS_TYPE_SYSTEM_ORIENTATION = const(0x2D3E)
+
 _COMMAND_REQUEST = const(0xF2)
 _COMMAND_RESPONSE = const(0xF1)
 
@@ -82,6 +85,8 @@ BNO_REPORT_LINEAR_ACCELERATION = const(0x04)
 # Rotation Vector
 BNO_REPORT_ROTATION_VECTOR = const(0x05)
 BNO_REPORT_GAME_ROTATION_VECTOR = const(0x08)
+BNO_REPORT_ARVR_STABILIZED_ROTATION_VECTOR = const(0x28)
+BNO_REPORT_ARVR_STABILIZED_GAME_ROTATION_VECTOR = const(0x29)
 
 BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR = const(0x09)
 
@@ -100,6 +105,8 @@ BNO_REPORT_GYRO_INTEGRATED_ROTATION_VECTOR = const(0x2A)
 # Euler Angles (in degrees?)
 # CALIBRATION
 # RAW ACCEL, MAG, GYRO # Sfe says each needs the non-raw enabled to work
+
+_FRS_READ_REQUEST
 
 _DEFAULT_REPORT_INTERVAL = const(50000)  # in microseconds = 50ms
 _QUAT_READ_TIMEOUT = 0.500  # timeout in seconds
@@ -144,6 +151,8 @@ _AVAIL_SENSOR_REPORTS = {
     BNO_REPORT_LINEAR_ACCELERATION: (_Q_POINT_8_SCALAR, 3, 10),
     BNO_REPORT_ROTATION_VECTOR: (_Q_POINT_14_SCALAR, 4, 14),
     BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR: (_Q_POINT_12_SCALAR, 4, 14),
+    BNO_REPORT_ARVR_STABILIZED_ROTATION_VECTOR: (_Q_POINT_14_SCALAR, 4, 14),
+    BNO_REPORT_ARVR_STABILIZED_GAME_ROTATION_VECTOR: (_Q_POINT_12_SCALAR, 4, 14),
     BNO_REPORT_GAME_ROTATION_VECTOR: (_Q_POINT_14_SCALAR, 4, 12),
     BNO_REPORT_STEP_COUNTER: (1, 1, 12),
     BNO_REPORT_SHAKE_DETECTOR: (1, 1, 6),
@@ -170,6 +179,8 @@ _INITIAL_REPORTS = {
     BNO_REPORT_STABILITY_CLASSIFIER: "Unknown",
     BNO_REPORT_ROTATION_VECTOR: (0.0, 0.0, 0.0, 0.0),
     BNO_REPORT_GAME_ROTATION_VECTOR: (0.0, 0.0, 0.0, 0.0),
+    BNO_REPORT_ARVR_STABILIZED_ROTATION_VECTOR: (0.0, 0.0, 0.0, 0.0),
+    BNO_REPORT_ARVR_STABILIZED_GAME_ROTATION_VECTOR: (0.0, 0.0, 0.0, 0.0),
     BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR: (0.0, 0.0, 0.0, 0.0),
 }
 
@@ -510,6 +521,8 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
         self._id_read = False
         # for saving the most recent reading when decoding several packets
         self._readings = {}
+        self._accuracies = {}
+        self._frs_system_orientation: list[float] = []
         self.initialize()
 
     def initialize(self):
@@ -542,6 +555,33 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
             return self._readings[BNO_REPORT_ROTATION_VECTOR]
         except KeyError:
             raise RuntimeError("No quaternion report found, is it enabled?") from None
+
+    @property
+    def quaternion_accuracy(self) -> int:
+        """An unsigned integer representing the accuracy of the current rotation vector"""
+        self._process_available_packets()
+        try:
+            return self._accuracies[BNO_REPORT_ROTATION_VECTOR]
+        except KeyError:
+            raise RuntimeError("No quaternion report found, is it enabled?") from None
+
+    @property
+    def quaternion_stabilized(self):
+        """A quaternion representing the current rotation vector"""
+        self._process_available_packets()
+        try:
+            return self._readings[BNO_REPORT_ARVR_STABILIZED_ROTATION_VECTOR]
+        except KeyError:
+            raise RuntimeError("No stabilized quaternion report found, is it enabled?") from None
+
+    @property
+    def quaternion_stabilized_accuracy(self) -> int:
+        """An unsigned integer representing the accuracy of the current rotation vector"""
+        self._process_available_packets()
+        try:
+            return self._accuracies[BNO_REPORT_ARVR_STABILIZED_GAME_ROTATION_VECTOR]
+        except KeyError:
+            raise RuntimeError("No stabilized quaternion report found, is it enabled?") from None
 
     @property
     def geomagnetic_quaternion(self):
@@ -868,6 +908,7 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
             self._readings[feature_report_id] = _INITIAL_REPORTS.get(
                 feature_report_id, (0.0, 0.0, 0.0)
             )
+            self._accuracies[feature_report_id] = 0
         if report_id == _COMMAND_RESPONSE:
             self._handle_command_response(report_bytes)
 
@@ -938,6 +979,7 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
         # TODO: FIXME; Sensor reports are batched in a LIFO which means that multiple reports
         # for the same type will end with the oldest/last being kept and the other
         # newer reports thrown away
+        self._accuracies[report_id] = accuracy
         self._readings[report_id] = sensor_data
 
     # TODO: Make this a Packet creation
@@ -956,22 +998,27 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
     # TODO: add docs for available features
     # TODO2: I think this should call an fn that imports all the bits for the given feature
     # so we're not carrying around  stuff for extra features
-    def enable_feature(self, feature_id):
+    def enable_feature(self, feature_id, report_interval=_DEFAULT_REPORT_INTERVAL):
         """Used to enable a given feature of the BNO08x"""
         self._dbg("\n********** Enabling feature id:", feature_id, "**********")
 
         if feature_id == BNO_REPORT_ACTIVITY_CLASSIFIER:
             set_feature_report = self._get_feature_enable_report(
-                feature_id, sensor_specific_config=_ENABLED_ACTIVITIES
+                feature_id,
+                report_interval=report_interval,
+                sensor_specific_config=_ENABLED_ACTIVITIES
             )
         else:
-            set_feature_report = self._get_feature_enable_report(feature_id)
+            set_feature_report = self._get_feature_enable_report(
+                feature_id,
+                report_interval=report_interval
+            )
 
         feature_dependency = _RAW_REPORTS.get(feature_id, None)
         # if the feature was enabled it will have a key in the readings dict
         if feature_dependency and feature_dependency not in self._readings:
             self._dbg("Enabling feature depencency:", feature_dependency)
-            self.enable_feature(feature_dependency)
+            self.enable_feature(feature_dependency, report_interval=report_interval)
 
         self._dbg("Enabling", feature_id)
         self._send_packet(_BNO_CHANNEL_CONTROL, set_feature_report)
@@ -983,6 +1030,99 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
             if feature_id in self._readings:
                 return
         raise RuntimeError("Was not able to enable feature", feature_id)
+
+    def get_system_orientation(self):
+        data = bytearray(6)
+        data[0] = _FRS_READ_REQUEST
+        pack_into("<H", data, 4, _FRS_TYPE_SYSTEM_ORIENTATION)
+        print("requesting system orientation")
+        self._send_packet(_BNO_CHANNEL_CONTROL, data)
+        print("waiting for system orientation")
+        while True:
+            self._wait_for_packet_type(
+                _BNO_CHANNEL_CONTROL, _FRS_READ_RESPONSE
+            )
+            frs_type = self._parse_frs_read_response_type()
+            if frs_type == _FRS_TYPE_SYSTEM_ORIENTATION:
+                if self._parse_frs_read_response_system_orientation():
+                    return self._frs_system_orientation
+
+    # def set_system_orientation(self, w: float, x: float, y: float, z: float):
+    #     data = bytearray(6)
+    #     data[0] = _FRS_WRITE_REQUEST
+    #     pack_into("<H", data, 2, 16)
+    #     pack_into("<H", data, 4, _FRS_TYPE_SYSTEM_ORIENTATION)
+    #     while True:
+    #         self._wait_for_packet_type(
+    #             _BNO_CHANNEL_CONTROL, _FRS_WRITE_RESPONSE
+    #         )
+    #         frs_type = self._parse_frs_read_response_type()
+    #         if frs_type == _FRS_TYPE_SYSTEM_ORIENTATION:
+    #             if self._parse_frs_read_response_system_orientation():
+    #                 return self._frs_system_orientation
+
+    # def _parse_frs_write_response(self):
+    #     if not self._data_buffer[4] == _FRS_WRITE_RESPONSE:
+    #         return None
+
+    #     status = self._get_data(1, "<B")
+
+    #     if status == 1:
+    #         raise RuntimeError("Unrecognized FRS type")
+
+    #     if status == 2:
+    #         raise RuntimeError("Busy")
+
+    #     if status == 3:
+    #         return True
+
+    #     if status == 5:
+    #         raise RuntimeError("Write failed")
+
+    #     if status == 9:
+    #         raise RuntimeError("FRS record is invalid")
+
+    #     if status == 11:
+    #         raise RuntimeError("FRS record is read only")
+
+    #     if status == 12:
+    #         raise RuntimeError("FRS memory is full")
+
+    def _parse_frs_read_response_type(self):
+        if not self._data_buffer[4] == _FRS_READ_RESPONSE:
+            return None
+
+        frs_type = self._get_data(12, "<H")
+        return frs_type
+
+    def _parse_frs_read_response_system_orientation(self):
+        byte1 = self._get_data(1, "<B")
+        num_words = byte1 >> 4
+        status = (byte1 << 4) >> 4
+        word_offset = self._get_data(2, "<H")
+        frs_type = self._get_data(12, "<H")
+        print("FRS Status: ", status)
+        print("FRS Length: ", num_words)
+
+        if status == 1:
+            raise RuntimeError("Unrecognized FRS type %d" % frs_type)
+
+        if status == 5:
+            print("record empty")
+            return True
+
+        if status == 8:
+            raise RuntimeError("Device error (DFU flash memory device unavailable")
+
+        if num_words > 0:
+            self._frs_system_orientation[word_offset] = self._get_data(4, "<f")
+
+        if num_words > 1:
+            self._frs_system_orientation[word_offset + 1] = self._get_data(4, "<f")
+
+        if status == 3:
+            # read record completed
+            return True
 
     def _check_id(self):
         self._dbg("\n********** READ ID **********")
@@ -1072,9 +1212,11 @@ class BNO08X:  # pylint: disable=too-many-instance-attributes, too-many-public-m
         self._dbg("OK!")
         # all is good!
 
+    @abstractmethod
     def _send_packet(self, channel, data):
         raise RuntimeError("Not implemented")
 
+    @abstractmethod
     def _read_packet(self):
         raise RuntimeError("Not implemented")
 
